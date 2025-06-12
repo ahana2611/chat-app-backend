@@ -1,23 +1,15 @@
-import express from 'express';
-import type { Request, Response } from 'express';
-import { createServer } from 'http';
-import { Server } from 'socket.io';
-import cors from 'cors';
+import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
-const app = express();
-const server = createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST"]
-  }
-});
-
-// Enable CORS and JSON parsing
-app.use(cors());
-app.use(express.json());
+// ✅ Connect to MongoDB
+mongoose.connect(process.env.MONGO_URI!)
+  .then(() => {
+    console.log("✅ MongoDB connected");
+  })
+  .catch((err) => {
+    console.error("❌ MongoDB connection error:", err);
+  });
 
 // JWT secret key (use env var in production)
 const JWT_SECRET = "cherritalk_secret_key";
@@ -39,144 +31,273 @@ interface LoginRequest {
   password: string;
 }
 
+// Data we store for each websocket
+interface WebSocketData {
+  userId: string;
+  email: string;
+  socketId: string;
+}
+
 const users: User[] = [];
 const connectedUsers = new Map<string, string>(); // socketId -> email
 
-// Home route
-app.get('/', (req, res) => {
-  res.send('Chat server is running');
-});
-
-// Signup
-app.post('/signup', (req: Request, res: Response) => {
-  try {
-    const { email, password }: SignupRequest = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+// Create a Bun server with WebSocket support
+const server = Bun.serve({
+  port: Number(process.env.PORT) || 3000,
+  websocket: {
+    // Define the message type
+    message(ws, message) {
+      try {
+        // Parse message
+        const msg = JSON.parse(message.toString());
+        
+        // If this is an auth message, handle authentication
+        if (msg.type === 'auth' && msg.token) {
+          handleAuthentication(ws, msg.token);
+          return;
+        }
+        
+        // Check if user is authenticated
+        if (!ws.data) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Not authenticated'
+          }));
+          return;
+        }
+        
+        // Handle chat message
+        if (msg.type === 'chat message') {
+          // Use type assertion to access the data safely
+          const userData = ws.data as WebSocketData;
+          
+          // Broadcast chat message to all clients
+          server.publish('all', JSON.stringify({
+            type: 'chat message',
+            text: msg.text,
+            user: userData.email,
+            userId: userData.userId,
+            timestamp: new Date()
+          }));
+        }
+      } catch (error) {
+        console.error("Error processing message:", error);
+      }
+    },
+    // Handle new WebSocket connections
+    open(ws) {
+      // Initial handshake - wait for auth message
+      ws.send(JSON.stringify({
+        type: 'welcome',
+        message: 'Please authenticate with an auth message containing your token'
+      }));
+    },
+    // Handle WebSocket disconnections
+    close(ws) {
+      try {
+        const wsData = ws.data;
+        if (wsData) {
+          // Using type assertion to access the data
+          const userData = wsData as unknown as WebSocketData;
+          const socketId = userData.socketId;
+          const email = userData.email;
+          
+          if (socketId && email) {
+            console.log(`❌ User disconnected: ${socketId} (${email})`);
+            connectedUsers.delete(socketId);
+            
+            // Notify all clients about disconnection
+            server.publish('all', JSON.stringify({
+              type: 'user disconnected',
+              email: email
+            }));
+          }
+        }
+      } catch (error) {
+        console.error("Error in WebSocket close:", error);
+      }
     }
-
-    if (users.some(user => user.email === email)) {
-      return res.status(409).json({ error: 'User already exists' });
-    }
-
-    const salt = bcrypt.genSaltSync(10);
-    const hashedPassword = bcrypt.hashSync(password, salt);
-
-    const newUser: User = {
-      id: crypto.randomUUID(),
-      email,
-      password: hashedPassword
+  },
+  async fetch(req) {
+    // Set CORS headers for all responses
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "http://localhost:5173, https://your-vercel-project.vercel.app",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Credentials": "true"
     };
-
-    users.push(newUser);
-
-    return res.status(201).json({ message: 'User created successfully' });
-  } catch (error) {
-    console.error('Signup error:', error);
-    return res.status(500).json({ error: 'Server error' });
+    
+    // Handle preflight OPTIONS requests
+    if (req.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+    
+    const url = new URL(req.url);
+    const path = url.pathname;
+    
+    // Base headers for all JSON responses
+    const jsonHeaders = {
+      ...corsHeaders,
+      "Content-Type": "application/json"
+    };
+    
+    // Home route
+    if (path === '/' && req.method === 'GET') {
+      return new Response('Chat server is running', { 
+        headers: { ...corsHeaders } 
+      });
+    }
+    
+    // Signup route
+    if (path === '/signup' && req.method === 'POST') {
+      try {
+        const data = await req.json() as SignupRequest;
+        const { email, password } = data;
+        
+        if (!email || !password) {
+          return new Response(JSON.stringify({ error: 'Email and password are required' }), { 
+            status: 400,
+            headers: jsonHeaders
+          });
+        }
+        
+        if (users.some(user => user.email === email)) {
+          return new Response(JSON.stringify({ error: 'User already exists' }), { 
+            status: 409,
+            headers: jsonHeaders
+          });
+        }
+        
+        const salt = bcrypt.genSaltSync(10);
+        const hashedPassword = bcrypt.hashSync(password, salt);
+        
+        const newUser: User = {
+          id: crypto.randomUUID(),
+          email,
+          password: hashedPassword
+        };
+        
+        users.push(newUser);
+        
+        return new Response(JSON.stringify({ message: 'User created successfully' }), {
+          status: 201,
+          headers: jsonHeaders
+        });
+      } catch (error) {
+        console.error('Signup error:', error);
+        return new Response(JSON.stringify({ error: 'Server error' }), {
+          status: 500,
+          headers: jsonHeaders
+        });
+      }
+    }
+    
+    // Login route
+    if (path === '/login' && req.method === 'POST') {
+      try {
+        const data = await req.json() as LoginRequest;
+        const { email, password } = data;
+        
+        if (!email || !password) {
+          return new Response(JSON.stringify({ error: 'Email and password are required' }), { 
+            status: 400,
+            headers: jsonHeaders
+          });
+        }
+        
+        const user = users.find(u => u.email === email);
+        if (!user) {
+          return new Response(JSON.stringify({ error: 'Invalid credentials' }), { 
+            status: 401,
+            headers: jsonHeaders
+          });
+        }
+        
+        const isMatch = bcrypt.compareSync(password, user.password);
+        if (!isMatch) {
+          return new Response(JSON.stringify({ error: 'Invalid credentials' }), { 
+            status: 401,
+            headers: jsonHeaders
+          });
+        }
+        
+        const token = jwt.sign(
+          { userId: user.id, email: user.email },
+          JWT_SECRET,
+          { expiresIn: '1h' }
+        );
+        
+        return new Response(JSON.stringify({ token }), {
+          status: 200,
+          headers: jsonHeaders
+        });
+      } catch (error) {
+        console.error('Login error:', error);
+        return new Response(JSON.stringify({ error: 'Server error' }), {
+          status: 500,
+          headers: jsonHeaders
+        });
+      }
+    }
+    
+    // Connected users route
+    if (path === '/users/connected' && req.method === 'GET') {
+      return new Response(JSON.stringify({
+        count: connectedUsers.size,
+        users: Array.from(connectedUsers.values())
+      }), {
+        status: 200,
+        headers: jsonHeaders
+      });
+    }
+    
+    // Not found for anything else
+    return new Response('Not Found', { 
+      status: 404,
+      headers: corsHeaders
+    });
   }
 });
 
-// Login
-app.post('/login', (req: Request, res: Response) => {
-  try {
-    const { email, password }: LoginRequest = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
-    }
-
-    const user = users.find(u => u.email === email);
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const isMatch = bcrypt.compareSync(password, user.password);
-    if (!isMatch) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = jwt.sign(
-      { userId: user.id, email: user.email },
-      JWT_SECRET,
-      { expiresIn: '1h' }
-    );
-
-    return res.json({ token });
-  } catch (error) {
-    console.error('Login error:', error);
-    return res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// 🔐 JWT Middleware for Socket.IO (query token based)
-io.use((socket, next) => {
-  // Get token from query parameters
-  const token = socket.handshake.query.token;
-
-  if (!token || typeof token !== 'string') {
-    return next(new Error('Authentication error: Token missing'));
-  }
-
+// Helper function to handle authentication
+function handleAuthentication(ws: any, token: string) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as { userId: string, email: string };
     
-    // Store user data in socket for later use
-    socket.data.userId = decoded.userId;
-    socket.data.email = decoded.email;
+    // Generate a unique ID for this websocket connection
+    const socketId = crypto.randomUUID();
+    
+    // Store user data in socket
+    ws.data = { 
+      userId: decoded.userId, 
+      email: decoded.email,
+      socketId: socketId
+    };
     
     // Add to connected users map
-    connectedUsers.set(socket.id, decoded.email);
+    connectedUsers.set(socketId, decoded.email);
     
-    next();
+    console.log(`✅ User connected: ${socketId} (${decoded.email})`);
+    
+    // Notify current user of all connected users
+    ws.send(JSON.stringify({ 
+      type: 'connected users',
+      users: Array.from(connectedUsers.values())
+    }));
+    
+    // Notify others
+    server.publish('all', JSON.stringify({
+      type: 'user connected',
+      email: decoded.email
+    }));
+    
   } catch (err) {
     console.error('Socket authentication error:', err);
-    next(new Error('Authentication error: Invalid token'));
+    ws.send(JSON.stringify({
+      type: 'error',
+      message: 'Authentication failed: Invalid token'
+    }));
   }
-});
+}
 
-// Socket.IO Connection Handling
-io.on('connection', (socket) => {
-  const email = socket.data.email;
-  const userId = socket.data.userId;
-
-  console.log(`✅ User connected: ${socket.id} (${email})`);
-
-  // Notify current user of all connected users
-  socket.emit('connected users', Array.from(connectedUsers.values()));
-
-  // Notify others
-  socket.broadcast.emit('user connected', { email });
-
-  // Chat message handling
-  socket.on('chat message', (msg) => {
-    io.emit('chat message', {
-      text: msg,
-      user: email,
-      userId,
-      timestamp: new Date()
-    });
-  });
-
-  // Disconnection
-  socket.on('disconnect', () => {
-    console.log(`❌ User disconnected: ${socket.id} (${email})`);
-    connectedUsers.delete(socket.id);
-    io.emit('user disconnected', { email });
-  });
-});
-
-// GET connected users
-app.get('/users/connected', (req: Request, res: Response) => {
-  res.json({
-    count: connectedUsers.size,
-    users: Array.from(connectedUsers.values())
-  });
-});
-
-// Start server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+console.log(`Server running on ${server.hostname}:${server.port}`);
